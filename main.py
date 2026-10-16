@@ -1,12 +1,14 @@
-from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form
-from fastapi.responses import FileResponse
+from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Form, WebSocket, WebSocketDisconnect
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import create_engine, Column, Integer, String, DateTime, ForeignKey
 from sqlalchemy.orm import declarative_base, sessionmaker, Session
 from datetime import datetime, timezone, timedelta
 from contextlib import asynccontextmanager
-from typing import List, Optional
+from typing import List, Optional, Dict
 import asyncio
+import zipfile
+import io
 import random
 import string
 import os
@@ -19,14 +21,11 @@ ALLOWED_EXTENSIONS = {".pdf", ".docx", ".csv", ".txt", ".jpg", ".jpeg"}
 UPLOAD_DIR = "uploads"
 os.makedirs(UPLOAD_DIR, exist_ok=True)
 
-# Fetch Neon URL from Render environment, fallback to SQLite for local testing
 SQLALCHEMY_DATABASE_URL = os.getenv("DATABASE_URL", "sqlite:///./rooms.db")
 
-# SQLAlchemy requires the prefix 'postgresql://' instead of 'postgres://'
 if SQLALCHEMY_DATABASE_URL.startswith("postgres://"):
     SQLALCHEMY_DATABASE_URL = SQLALCHEMY_DATABASE_URL.replace("postgres://", "postgresql://", 1)
 
-# SQLite needs specific thread arguments, PostgreSQL does not
 if SQLALCHEMY_DATABASE_URL.startswith("sqlite"):
     engine = create_engine(SQLALCHEMY_DATABASE_URL, connect_args={"check_same_thread": False})
 else:
@@ -55,29 +54,58 @@ class FileRecord(Base):
 Base.metadata.create_all(bind=engine)
 
 # ==========================================
-# 3. BACKGROUND CLEANUP TASK
+# 3. WEBSOCKET CONNECTION MANAGER
+# ==========================================
+class ConnectionManager:
+    def __init__(self):
+        self.active_connections: Dict[str, List[WebSocket]] = {}
+
+    async def connect(self, websocket: WebSocket, room_code: str):
+        await websocket.accept()
+        if room_code not in self.active_connections:
+            self.active_connections[room_code] = []
+        self.active_connections[room_code].append(websocket)
+        await self.broadcast_headcount(room_code)
+
+    def disconnect(self, websocket: WebSocket, room_code: str):
+        if room_code in self.active_connections and websocket in self.active_connections[room_code]:
+            self.active_connections[room_code].remove(websocket)
+            if not self.active_connections[room_code]:
+                del self.active_connections[room_code]
+        asyncio.create_task(self.broadcast_headcount(room_code))
+
+    async def broadcast_headcount(self, room_code: str):
+        if room_code in self.active_connections:
+            count = len(self.active_connections[room_code])
+            student_count = max(0, count - 1) # Exclude instructor
+            await self.broadcast(room_code, {"type": "headcount", "count": student_count})
+
+    async def broadcast(self, room_code: str, message: dict):
+        if room_code in self.active_connections:
+            for connection in self.active_connections[room_code]:
+                try:
+                    await connection.send_json(message)
+                except:
+                    pass
+
+manager = ConnectionManager()
+
+# ==========================================
+# 4. BACKGROUND CLEANUP TASK
 # ==========================================
 async def cleanup_expired_rooms():
     while True:
-        await asyncio.sleep(900)  # Check every 15 minutes
-        
+        await asyncio.sleep(900)  # Check every 15 mins
         db = SessionLocal()
         try:
             expiration_time = datetime.now(timezone.utc) - timedelta(minutes=60)
             expired_rooms = db.query(Room).filter(Room.created_at < expiration_time).all()
-            
             for room in expired_rooms:
-                print(f"Cleaning up expired room: {room.code}")
-                
-                # Delete physical files
                 room_dir = os.path.join(UPLOAD_DIR, room.code)
                 if os.path.exists(room_dir):
                     shutil.rmtree(room_dir)
-                
-                # Delete database records
                 db.query(FileRecord).filter(FileRecord.room_code == room.code).delete()
                 db.query(Room).filter(Room.code == room.code).delete()
-            
             db.commit()
         except Exception as e:
             print(f"Error during cleanup: {e}")
@@ -91,14 +119,13 @@ async def lifespan(app: FastAPI):
     cleanup_task.cancel()
 
 # ==========================================
-# 4. FASTAPI APPLICATION
+# 5. FASTAPI APPLICATION
 # ==========================================
 app = FastAPI(title="EduVault API", lifespan=lifespan)
 
-# CORS enabled so Netlify can talk to Render
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], 
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -118,12 +145,20 @@ def generate_unique_code(db: Session) -> str:
             return code
 
 # ==========================================
-# 5. ENDPOINTS
+# 6. ENDPOINTS
 # ==========================================
 @app.get("/keep-alive")
 def keep_alive():
-    """Endpoint for UptimeRobot to ping so Render doesn't sleep."""
     return {"status": "awake", "time": datetime.now().isoformat()}
+
+@app.websocket("/ws/{room_code}")
+async def websocket_endpoint(websocket: WebSocket, room_code: str):
+    await manager.connect(websocket, room_code)
+    try:
+        while True:
+            await websocket.receive_text()
+    except WebSocketDisconnect:
+        manager.disconnect(websocket, room_code)
 
 @app.post("/create-room")
 def create_room(db: Session = Depends(get_db)):
@@ -166,6 +201,9 @@ def upload_to_room(
         saved_files.append(file.filename)
     
     db.commit()
+    
+    # Trigger WebSocket update to students
+    asyncio.create_task(manager.broadcast(room_code, {"type": "new_files"}))
     return {"status": "success", "message_saved": bool(message), "files_saved": saved_files}
 
 @app.get("/room/{room_code}")
@@ -183,34 +221,44 @@ def get_room(room_code: str, db: Session = Depends(get_db)):
 
 @app.get("/room/{room_code}/download/{filename}")
 def download_file(room_code: str, filename: str, db: Session = Depends(get_db)):
-    room = db.query(Room).filter(Room.code == room_code).first()
-    if not room:
-        raise HTTPException(status_code=404, detail="Room not found")
-    
-    file_record = db.query(FileRecord).filter(
-        FileRecord.room_code == room_code, 
-        FileRecord.filename == filename
-    ).first()
-    
+    file_record = db.query(FileRecord).filter(FileRecord.room_code == room_code, FileRecord.filename == filename).first()
     if not file_record:
         raise HTTPException(status_code=404, detail="File not found")
-        
     return FileResponse(path=file_record.filepath, filename=file_record.filename)
+
+@app.get("/room/{room_code}/download-all")
+def download_all_files(room_code: str, db: Session = Depends(get_db)):
+    files = db.query(FileRecord).filter(FileRecord.room_code == room_code).all()
+    if not files:
+        raise HTTPException(status_code=404, detail="No files to download")
+
+    zip_buffer = io.BytesIO()
+    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zip_file:
+        for file_record in files:
+            if os.path.exists(file_record.filepath):
+                zip_file.write(file_record.filepath, arcname=file_record.filename)
+    
+    zip_buffer.seek(0)
+    return StreamingResponse(
+        zip_buffer, 
+        media_type="application/zip",
+        headers={"Content-Disposition": f"attachment; filename=EduVault_{room_code}.zip"}
+    )
+
 @app.delete("/room/{room_code}")
 def delete_room_now(room_code: str, db: Session = Depends(get_db)):
-    """The 'Nuke' button: Instantly deletes the room and all files."""
     room = db.query(Room).filter(Room.code == room_code).first()
     if not room:
         raise HTTPException(status_code=404, detail="Room not found")
     
-    # 1. Delete physical files from server
     room_dir = os.path.join(UPLOAD_DIR, room_code)
     if os.path.exists(room_dir):
         shutil.rmtree(room_dir)
         
-    # 2. Delete from database
     db.query(FileRecord).filter(FileRecord.room_code == room_code).delete()
     db.query(Room).filter(Room.code == room_code).delete()
     db.commit()
     
-    return {"status": "success", "message": "Room and files instantly destroyed."}
+    # Broadcast to all students that the room was destroyed
+    asyncio.create_task(manager.broadcast(room_code, {"type": "room_nuked"}))
+    return {"status": "success", "message": "Room destroyed"}
