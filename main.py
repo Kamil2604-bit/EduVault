@@ -170,7 +170,7 @@ def create_room(db: Session = Depends(get_db)):
     return {"status": "success", "room_code": db_room.code}
 
 @app.post("/room/{room_code}/upload")
-def upload_to_room(
+async def upload_to_room(
     room_code: str,
     files: List[UploadFile] = File(default=[]),
     message: Optional[str] = Form(None),
@@ -202,8 +202,8 @@ def upload_to_room(
     
     db.commit()
     
-    # Trigger WebSocket update to students
-    asyncio.create_task(manager.broadcast(room_code, {"type": "new_files"}))
+    # Broadcast using await instead of run_in_background
+    await manager.broadcast(room_code, {"type": "new_files"})
     return {"status": "success", "message_saved": bool(message), "files_saved": saved_files}
 
 @app.get("/room/{room_code}")
@@ -246,7 +246,7 @@ def download_all_files(room_code: str, db: Session = Depends(get_db)):
     )
 
 @app.delete("/room/{room_code}")
-def delete_room_now(room_code: str, db: Session = Depends(get_db)):
+async def delete_room_now(room_code: str, db: Session = Depends(get_db)):
     room = db.query(Room).filter(Room.code == room_code).first()
     if not room:
         raise HTTPException(status_code=404, detail="Room not found")
@@ -259,6 +259,6 @@ def delete_room_now(room_code: str, db: Session = Depends(get_db)):
     db.query(Room).filter(Room.code == room_code).delete()
     db.commit()
     
-    # Broadcast to all students that the room was destroyed
-    asyncio.create_task(manager.broadcast(room_code, {"type": "room_nuked"}))
+    # Broadcast using await
+    await manager.broadcast(room_code, {"type": "room_nuked"})
     return {"status": "success", "message": "Room destroyed"}
