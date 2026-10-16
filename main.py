@@ -196,3 +196,21 @@ def download_file(room_code: str, filename: str, db: Session = Depends(get_db)):
         raise HTTPException(status_code=404, detail="File not found")
         
     return FileResponse(path=file_record.filepath, filename=file_record.filename)
+@app.delete("/room/{room_code}")
+def delete_room_now(room_code: str, db: Session = Depends(get_db)):
+    """The 'Nuke' button: Instantly deletes the room and all files."""
+    room = db.query(Room).filter(Room.code == room_code).first()
+    if not room:
+        raise HTTPException(status_code=404, detail="Room not found")
+    
+    # 1. Delete physical files from server
+    room_dir = os.path.join(UPLOAD_DIR, room_code)
+    if os.path.exists(room_dir):
+        shutil.rmtree(room_dir)
+        
+    # 2. Delete from database
+    db.query(FileRecord).filter(FileRecord.room_code == room_code).delete()
+    db.query(Room).filter(Room.code == room_code).delete()
+    db.commit()
+    
+    return {"status": "success", "message": "Room and files instantly destroyed."}
